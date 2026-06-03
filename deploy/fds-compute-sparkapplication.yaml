@@ -44,6 +44,17 @@ stringData:
 
 ---
 
+# ── Encryption key for output bucket SSE-C (different from input keys) ────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fds-compute-output-encryption-key
+  namespace: spark-operator
+stringData:
+  sse-c-key: "<OUTPUT_SSE_C_KEY_BASE64>"
+
+---
+
 apiVersion: sparkoperator.k8s.io/v1beta2
 kind: SparkApplication
 metadata:
@@ -90,10 +101,12 @@ spec:
     "spark.kubernetes.driver.secretKeyRef.S3_SECRET_KEY":        "fds-compute-input-creds:secret-key"
     "spark.kubernetes.driver.secretKeyRef.S3_OUTPUT_ACCESS_KEY": "fds-compute-output-creds:access-key"
     "spark.kubernetes.driver.secretKeyRef.S3_OUTPUT_SECRET_KEY": "fds-compute-output-creds:secret-key"
+    "spark.kubernetes.driver.secretKeyRef.S3_OUTPUT_SSE_C_KEY":  "fds-compute-output-encryption-key:sse-c-key"
     "spark.kubernetes.executor.secretKeyRef.S3_ACCESS_KEY":        "fds-compute-input-creds:access-key"
     "spark.kubernetes.executor.secretKeyRef.S3_SECRET_KEY":        "fds-compute-input-creds:secret-key"
     "spark.kubernetes.executor.secretKeyRef.S3_OUTPUT_ACCESS_KEY": "fds-compute-output-creds:access-key"
     "spark.kubernetes.executor.secretKeyRef.S3_OUTPUT_SECRET_KEY": "fds-compute-output-creds:secret-key"
+    "spark.kubernetes.executor.secretKeyRef.S3_OUTPUT_SSE_C_KEY":  "fds-compute-output-encryption-key:sse-c-key"
     "spark.kubernetes.driverEnv.FD_DEBUG_DUMP":                    "false"
     # Per-run id: change for every pipeline run. Propagated to driver+executor
     # JVMs (spark-operator's env: array does not reliably reach JVM env).

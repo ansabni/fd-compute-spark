@@ -496,17 +496,25 @@ object StackDistancePipelineJob {
         if (outputFiles.isEmpty) {
           log(s"WARNING: No stdtime.* files found in $localOutputDir — nothing to upload")
         } else {
-          val latestKeyIndex = encKeys.keys.map(_.toInt).max.toString
-          val latestKey      = encKeys(latestKeyIndex)
-          log(s"Using encryption key index=$latestKeyIndex for upload")
+          // If S3_OUTPUT_SSE_C_KEY is set (dedicated output bucket key injected via
+          // spark.kubernetes.executor.secretKeyRef), use it; otherwise fall back to
+          // the highest-indexed key from the input encryption-keys.json.
+          val (uploadSseCKey, uploadKeyLabel) = sys.env.get("S3_OUTPUT_SSE_C_KEY") match {
+            case Some(k) => (k, "S3_OUTPUT_SSE_C_KEY")
+            case None    =>
+              val idx = encKeys.keys.map(_.toInt).max.toString
+              log(s"S3_OUTPUT_SSE_C_KEY not set — falling back to input key index=$idx")
+              (encKeys(idx), s"input-key-$idx")
+          }
+          log(s"Using SSE-C key source=$uploadKeyLabel for upload")
 
-          val uploadConf = s3aConf(ak, sk, latestKey)
+          val uploadConf = s3aConf(ak, sk, uploadSseCKey)
           log(s"Creating S3 FileSystem for s3a://$outBucket ...")
           val s3Fs = FileSystem.get(new java.net.URI(s"s3a://$outBucket"), uploadConf)
           log("S3 FileSystem created OK")
 
           outputFiles.foreach { f =>
-            val s3FileName = s"${f.getName}.key$latestKeyIndex"
+            val s3FileName = s"${f.getName}.key$uploadKeyLabel"
             val dest       = new Path(s"s3a://$outBucket/$outPrefix/$s3FileName")
             log(s"Uploading ${f.getName} (${f.length} bytes) → $dest")
             val localIn = new java.io.FileInputStream(f)
