@@ -69,8 +69,7 @@ spec:
   imagePullPolicy: IfNotPresent
 
   mainClass: com.fd.compute.StackDistancePipelineJob
-  mainApplicationFile: "https://fds-jar.in-maa-1.linodeobjects.com/fd_compute_jar/withRegex/fd-compute-spark-assembly.jar"
-
+  mainApplicationFile: "https://fds-jar.in-maa-1.linodeobjects.com/fd_compute_jar/witheverythingJune3/fd-compute-spark-assembly.jar"
   sparkVersion: "3.5.0"
 
   restartPolicy:
