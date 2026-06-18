@@ -98,7 +98,70 @@ object StackDistancePipelineJob {
     m.map(_.group(1)).getOrElse("1")
   }
 
+  // All FD_MAPREDUCE_*_FILE env vars that point to INPUT files the C++ code
+  // reads via fopen().  (FD_MAPREDUCE_WRITE_SERIAL_INFO_FILE is an output path
+  // written by C++, not a download target.)
+  val S3_FILE_ENV_VARS: Seq[String] = Seq(
+    "FD_MAPREDUCE_VCDS_FILE",
+    "FD_MAPREDUCE_CPCODES_FILE",
+    "FD_MAPREDUCE_REGIONS_FILE",
+    "FD_MAPREDUCE_GHOSTIP_FILE",
+    "FD_MAPREDUCE_CPCODE_MAP_FILE",
+    "FD_MAPREDUCE_VCD_MAP_NETWORK_FILE",
+    "FD_MAPREDUCE_ARL_VCD_TRANSLATION_FILE"
+  )
 
+  /**
+   * For each FD_MAPREDUCE_*_FILE env var whose value starts with s3:// or s3a://,
+   * download the file to a task-local temp directory and return a newline-separated
+   * string of "KEY=/local/path" pairs to pass to mapperInit / reducerInit.
+   *
+   * Vars that are not set, or that already point to local paths, are skipped —
+   * C++ will handle them as-is via getenv().
+   *
+   * @param accessKey      S3 access key
+   * @param secretKey      S3 secret key
+   * @param encryptionKeys Map of key index → base64 SSE-C key
+   * @param taskTempDir    Directory to download files into (must already exist)
+   */
+  def downloadS3ConfigFiles(
+    accessKey:      String,
+    secretKey:      String,
+    encryptionKeys: Map[String, String],
+    taskTempDir:    java.io.File
+  ): String = {
+    val overrides = scala.collection.mutable.ArrayBuffer[String]()
+    for (varName <- S3_FILE_ENV_VARS) {
+      sys.env.get(varName) match {
+        case Some(v) if v.startsWith("s3://") || v.startsWith("s3a://") =>
+          val s3Path    = if (v.startsWith("s3://")) "s3a://" + v.stripPrefix("s3://") else v
+          val keyIdx    = keyIndexOf(s3Path)
+          val sseKey    = encryptionKeys.getOrElse(keyIdx,
+            throw new IllegalArgumentException(
+              s"No encryption key for index '$keyIdx' needed by $varName=$v"))
+          val fileName  = s3Path.split("/").last.replaceAll("""\.key\d+$""", "")
+          val localFile = new java.io.File(taskTempDir, fileName)
+          println(s"[S3 config] Downloading $varName from $s3Path → ${localFile.getAbsolutePath}")
+          val conf = s3aConf(accessKey, secretKey, sseKey)
+          val path = new Path(s3Path)
+          val fs   = FileSystem.get(path.toUri, conf)
+          val in   = fs.open(path)
+          val out  = new java.io.FileOutputStream(localFile)
+          try {
+            val buf = new Array[Byte](64 * 1024)
+            var n = in.read(buf)
+            while (n > 0) { out.write(buf, 0, n); n = in.read(buf) }
+          } finally { in.close(); out.close(); fs.close() }
+          println(s"[S3 config]   → ${localFile.length()} bytes")
+          overrides += s"$varName=${localFile.getAbsolutePath}"
+        case Some(_) =>
+          // Already a local path — C++ opens it directly, nothing to do
+        case None =>
+          // Not set — C++ will just skip it
+      }
+    }
+    overrides.mkString("\n")
+  }
 
   /**
    * Build a Hadoop Configuration for S3A with SSE-C decryption.
@@ -323,7 +386,20 @@ object StackDistancePipelineJob {
 
         val libPath = s"${org.apache.spark.SparkFiles.getRootDirectory()}/libFDCompute.so"
         FDComputeNative.ensureLoaded(libPath)
-        val handle = FDComputeNative.mapperInit("", "")
+
+        // Download any FD_MAPREDUCE_*_FILE env vars that point to S3 (e.g.
+        // FD_MAPREDUCE_VCD_MAP_NETWORK_FILE / FD_MAPREDUCE_ARL_VCD_TRANSLATION_FILE)
+        // to a task-local temp file, and pass the rewritten local paths to the
+        // JNI layer so readConfig()'s fopen() finds a real path.
+        // Files.createTempDirectory (not a partitionId-keyed path under /tmp)
+        // guarantees a unique directory regardless of speculative execution,
+        // task retries, or concurrent unrelated job runs reusing partition 0..N.
+        val cfgTempDir = java.nio.file.Files.createTempDirectory("fd_cfg_map_").toFile
+        val mapperEnvOverrides = downloadS3ConfigFiles(ak, sk, keys, cfgTempDir)
+        if (mapperEnvOverrides.nonEmpty)
+          println(s"[mapper] Env overrides for C++ readConfig:\n${mapperEnvOverrides.linesIterator.map("  " + _).mkString("\n")}")
+
+        val handle = FDComputeNative.mapperInit("", mapperEnvOverrides)
 
         val outputLines = iter
           .grouped(mapperBatchSize)
@@ -454,6 +530,11 @@ object StackDistancePipelineJob {
         val outEncKeys  = bcOutputEncryptionKeys.value
         val outBucket   = bcOutputBucket.value
         val outPrefix   = bcS3OutputPrefix.value
+        // FD_MAPREDUCE_*_FILE config files (VCD map, arl/vcd translation, ...)
+        // live on the INPUT side, keyed by the input SSE-C keys — not the
+        // output bucket creds used for uploading stdtime.* above.
+        val inputAk     = bcAccessKey.value
+        val inputSk     = bcSecretKey.value
 
         log(s"hostname=${java.net.InetAddress.getLocalHost.getHostName}")
         log(s"outBucket=$outBucket  outPrefix=$outPrefix")
@@ -499,7 +580,23 @@ object StackDistancePipelineJob {
           .filter { case (k, _) => k.startsWith("FD_MAPREDUCE_") }
           .map    { case (k, v) => s"$k=$v" }
           .toSeq
-        val envOverridesStr = (fdEnvOverrides :+ s"FD_MAPREDUCE_OUTPUT_DIR=$localOutputDir").mkString("\n")
+
+        // Any FD_MAPREDUCE_*_FILE var pointing at S3 (e.g. VCD_MAP_NETWORK_FILE,
+        // ARL_VCD_TRANSLATION_FILE) gets downloaded here to a local temp file.
+        // Its override line is appended AFTER the generic forwarding above, so
+        // it wins — applyEnvOverrides() setenv()s in order, last write wins —
+        // over the raw s3a://... value coming through the generic forward.
+        // Files.createTempDirectory (not a partitionId-keyed path under /tmp)
+        // guarantees a unique directory regardless of speculative execution,
+        // task retries, or concurrent unrelated job runs reusing partition 0..N.
+        val cfgTempDir = java.nio.file.Files.createTempDirectory("fd_cfg_reduce_").toFile
+        val s3ConfigOverrides = downloadS3ConfigFiles(inputAk, inputSk, encKeys, cfgTempDir)
+        if (s3ConfigOverrides.nonEmpty)
+          log(s"S3 config overrides: ${s3ConfigOverrides.replace("\n", " | ")}")
+
+        val envOverridesStr =
+          (fdEnvOverrides ++ s3ConfigOverrides.linesIterator.toSeq :+ s"FD_MAPREDUCE_OUTPUT_DIR=$localOutputDir")
+            .mkString("\n")
         log(s"envOverrides: ${envOverridesStr.replace("\n", " | ")}")
         native.reducerInit(partitionId, numReducers, envOverridesStr)
         log("reducerInit OK")
