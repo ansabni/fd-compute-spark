@@ -463,6 +463,8 @@ Launched reduce tasks = 2048
 | 2 | Ran with `FD_DEBUG_DUMP=true` to inspect raw mapper output (no code change, config-only) | `run-3fd-20260616-8-debug`, `-9-debug` | Done — surfaced the 1039-vs-1864 contradiction, confirmed not a recompute artifact via `.persist()`. |
 | 3 | Cached `mapOutput` in the `FD_DEBUG_DUMP` path before counting | `StackDistancePipelineJob.scala` (~line 348) | Kept — harmless, debug-only, confirms 1039/4471 are stable. |
 | 4 | Delete leftover files in the shared `localOutputDir` before each partition's `reducerInit()` | `StackDistancePipelineJob.scala` (~line 459, after `localDir.mkdirs()`) | **Applied, testing.** Targets the proven shared-directory contamination bug (790 unique / 1815 total files in run-10). Deployed as run-11; 0 stale-file warnings logged, output comparison in progress. |
+| 5 | Persist `mapOutput` with `DISK_ONLY_2` before the shuffle (production + debug paths) | `StackDistancePipelineJob.scala` (after `mapPartitions` block, before debug-dump check) | **Reverted.** Was a band-aid that only made fetch-failure *retries* cheaper without stopping the executor from dying; at expansion scale, replicating hundreds of GiB of intermediate output 2× is actively harmful. Removed together with its companion standard-YAML tweaks (`spark.shuffle.io.retryWait` 60s, `spark.storage.replication.proactive`). Superseded by row 6, which fixes the actual OOM. |
+| 6 | Stream mapper output via a hand-rolled `Iterator[String]` instead of `.toList`; call `mapperFinalize` exactly once on exhaustion, guarded by an `AtomicBoolean` + a `TaskContext` completion-listener backstop | `StackDistancePipelineJob.scala` (mapper `flatMap`, ~line 495) | **Applied.** The real OOM fix — the old `.toList` buffered a whole 2+ GB file's mapper output (~19 GiB) in heap before returning. Streaming keeps one batch resident; the guarded finalize also closes the native `MapperCtx` leak the old post-`.toList` finalize call had on any mid-file exception. See the "Expansion job — executor OOM" section above. |
 
 ## Artifacts from this session
 - `run-3fd-20260616-7` — partitioner-fix test (reverted, kept on cluster history for reference)
@@ -470,3 +472,140 @@ Launched reduce tasks = 2048
 - `run-3fd-20260616-10` — full run, current (reverted) partitioner, proved the shared-directory duplication bug (1815 files / 790 unique)
 - `run-3fd-20260616-11` — full run with the stale-file cleanup fix, output comparison in progress
 - JARs uploaded to `fds-jar.in-maa-1.linodeobjects.com`: `fd_compute_jar/partitionerfix/` (broken, do not reuse), `fd_compute_jar/withJNIfix2/` (current reverted/good code)
+
+## Expansion job — executor OOM / FetchFailedException (root cause found)
+
+**Symptom (misleading):** the job first surfaces as
+`org.apache.spark.shuffle.FetchFailedException` →
+`ExecutorDeadException: ... executor(Id: 5) ... is dead`. That is *not* the
+cause — it's the aftermath. An executor died, so the shuffle blocks it held
+(local disk, no External Shuffle Service on k8s) became unfetchable and the
+downstream stage failed. The real question is **why the executor died.**
+
+**Root cause: per-task heap OOM on expansion-scale input.** This is the
+expansion job (`exp_input`, `fds-compute-testdata`), whose files are nothing
+like the tiny 389-file standard set. The executor logs show:
+
+- Input gzip files are **2.2-2.3 GB *compressed*** (S3AInputStream:
+  `expected: 2,242,049,524`), ~**100-193 million lines** each
+  (`Lines read 193279335`).
+- One Spark partition == one whole file (`parallelize(allFiles, allFiles.size)`,
+  kept that way on purpose for per-file VCD/network context).
+- A single map task's output is huge: `ShuffleExternalSorter: Task 48 ...
+  spilling sort data of 19.0 GiB to disk`, others 9.5 / 10.2 GiB.
+- Execution memory is exhausted: `TaskMemoryManager: Failed to allocate a
+  page (1073741824 bytes / 2147483648 bytes), try again` — repeated.
+- The executor is so busy spilling / GC-thrashing that S3 sockets idle-die
+  mid-read: `ConnectionClosedException: Premature end of Content-Length
+  delimited message body (expected 2.2 GB, received 1.1 GB)`.
+- The pod then exceeds its cgroup memory limit → **Kubernetes OOMKills the
+  executor** → ExecutorDead → FetchFailed cascade above.
+
+**The specific code bug:** the mapper `mapPartitions` used
+```scala
+val collected = readEncryptedGzipFile(...).grouped(...).flatMap {...}.toList
+FDComputeNative.mapperFinalize(handle)
+collected.iterator
+```
+The `.toList` **materialised the ENTIRE per-file mapper output in JVM heap**
+before returning — up to ~19 GiB — purely so `mapperFinalize()` could be
+called after the last batch. That defeats Spark's streaming design and is an
+instant OOM at expansion scale (fine for the 4 KB standard job, fatal here).
+
+**Fix applied (`StackDistancePipelineJob.scala`):** stream the output lazily
+through a small hand-rolled `Iterator[String]` whose `advance()` calls
+`mapperFinalize` exactly once the instant the input file is exhausted — so
+only ~one batch (`mapperBatchSize` lines) is resident at a time and Spark's
+shuffle writer spills incrementally. (Spark's own `CompletionIterator` would
+do this, but it is `private[spark]` and not accessible from `com.fd.compute`,
+so it is hand-rolled.) An `AtomicBoolean`-guarded `finalizeOnce()` plus a
+`TaskContext` completion-listener backstop guarantee the native `MapperCtx` is
+freed exactly once even if the task is killed or throws mid-file (no native
+handle leak across the many sequential tasks that share one executor JVM).
+Note this is strictly safer than the old `.toList` code, whose
+`mapperFinalize(handle)` sat *after* the `.toList` and so was skipped entirely
+— leaking the context — whenever `mapperProcessBatch` threw mid-file.
+
+**Supporting config (RECOMMENDED — currently reverted, NOT in the YAML):**
+These were proposed as `fds-compute-expansion-sparkapplication.yaml` edits but
+were undone; the file is back at its original values (`retryWait 15s`,
+executor `instances 3`, `memory 8g`, `memoryOverhead 2g`, no `spark.speculation`
+line). They are complementary hardening — the Scala streaming fix above is what
+actually removes the OOM — and can be re-applied if executors still struggle:
+- `spark.speculation=false` — the logs show duplicate concurrent copies of
+  these 15-30 min giant tasks ("another attempt succeeded"); speculation just
+  doubled memory + S3 load and made OOM likelier, for deterministic reads
+  that gain nothing from it.
+- executor `memory` 8g→16g, `memoryOverhead` 2g→4g — headroom for the shuffle
+  sorter to spill gracefully and for the C++ library's off-heap allocations
+  (native memory counts against overhead, not heap).
+- executor `instances` 3→6 — fewer sequential giant tasks per executor.
+- `spark.shuffle.io.retryWait` 15s→30s.
+
+**Note — reverted band-aid:** an earlier attempt persisted `mapOutput` with
+`DISK_ONLY_2` to make fetch-failure *retries* cheaper. That only masked the
+symptom (and, at expansion scale, replicating hundreds of GiB of intermediate
+output 2× is actively harmful), so it was removed. With the OOM fixed,
+executors stop dying, so fetch failures stop and the persist is unnecessary.
+
+**Open follow-up (not code):** even streamed, one 20 GiB-output partition per
+2 GB file is a lot for a single task. If runtime/spill is still painful, the
+durable fix is upstream — split the giant per-network gzip files into smaller
+shards so each maps to its own partition — but that changes the input layout
+and needs sign-off.
+
+## Memory instrumentation added to isolate the crash in production
+
+The OOM diagnosis above was inferred from Spark's own `ShuffleExternalSorter` /
+`TaskMemoryManager` lines. To *confirm* it on the next run — and to tell JVM-heap
+growth apart from native C++ growth — added end-to-end memory instrumentation
+across all three layers. All of it is gated by `FD_DEBUG_MEM` (default **on**,
+rate-limited) so it's a no-op when disabled.
+
+**Why three layers:** the k8s OOMKiller acts on whole-process **RSS** (JVM heap
++ every native malloc/`std::string`). The JVM can't see the C++ side; the C++
+side can't break out JVM heap. So we log process RSS + `oom_score` from
+`/proc/self/*` in C++ (ground truth) *and* `Runtime` heap from Scala, correlated
+by line/batch counts. That lets the next run answer precisely: "died at line
+140M of file X, RSS 9.8 GB, JVM heap flat 2 GB → native/shuffle, not heap."
+
+**New shared header `cpp_src/mem_debug.h`** — `static inline` readers for
+`VmRSS`/`VmHWM` (kB) and `oom_score` from `/proc/self/status` and
+`/proc/self/oom_score`; Linux-only, return -1 elsewhere so macOS dev builds stay
+clean. Toggles: `FD_DEBUG_MEM` (on/off), `FD_DEBUG_MEM_INTERVAL` (mapper lines
+between logs, default 5,000,000).
+
+**`stack_distance.map.cpp`** — the mapper previously logged *nothing* until a
+file finished (a 193M-line file = 700 s of silence). Added:
+- `[FD_MEM] mapper/init` — baseline RSS at partition start.
+- `[FD_MEM] mapper/process lines=… outBytesSoFar=… rss=… peak=… oom_score=…` —
+  threshold-based every `FD_DEBUG_MEM_INTERVAL` lines (~38 lines for a 193M-line
+  file). Shows how far a task got and whether native RSS is climbing.
+- `[FD_MEM] mapper/finalize` — final totals incl. cumulative output bytes
+  (`outBytesTotal`, tracked via two new `MapperCtx` fields), which reveals output
+  amplification (e.g. `computeBothServedAndMiss` emits 2 lines per input line).
+
+**`stack_distance.reduce.cpp`** —
+- **Fixed a latent bug:** the periodic "processed N" block printed an
+  *uninitialised* `statm_t` (its `read_off_memory_status()` was commented out) —
+  garbage size/rss/text/data. Replaced with real `[FD_MEM] reducer/process`.
+- `[FD_MEM] reducer/allocate nodelen=… allocatedMB=… rss=…` right after
+  `allocate_memory()` — makes the **~5 GB up-front allocation for the default
+  `NODELEN=105,000,000`** explicit (grabbed the instant the first line hits a
+  reducer; a prime OOM suspect for the *reduce* stage on an 8 GB executor).
+- `[FD_MEM] reducer/init`, `.../finalize`, and the `md5-exceeded` path all now
+  emit uniform RSS/peak/oom_score lines.
+
+**`StackDistancePipelineJob.scala`** — new `MemDebug` helper logging JVM heap
+(`Runtime`) alongside the same `/proc/self/status` RSS. Snapshots:
+- Mapper: every `FD_DEBUG_MEM_BATCHES` (default 200) batches → executor stderr
+  (keep the pod via `deleteOnTermination=false` to read it).
+- Reducer: at post-init / periodic / pre- & post-finalize, via `log()` — these
+  are collected back to the **driver**, so reduce-stage memory is always visible
+  even after the executor pod is gone.
+
+Verified: both C++ files compile with the existing `compile_native.sh` (only
+pre-existing warnings) and link into `libFDCompute.dylib`; the Scala file has no
+errors. **No algorithm/logic changed — instrumentation only.** Rebuild the
+Linux `.so` (Docker `ubuntu:22.04`, `--platform linux/amd64`) + JAR and redeploy
+to capture the `[FD_MEM]` lines on the next cluster run.

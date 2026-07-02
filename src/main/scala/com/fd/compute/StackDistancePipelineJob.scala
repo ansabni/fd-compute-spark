@@ -45,6 +45,49 @@ object StackDistancePipelineJob {
   def s3Endpoint:       String = sys.env.getOrElse("S3_ENDPOINT", "us-ord-10.linodeobjects.com")
 
   // -------------------------------------------------------------------------
+  // Memory instrumentation — the JVM-side counterpart to cpp_src/mem_debug.h.
+  //
+  // The C++ readers report whole-process RSS (which includes the JVM), but they
+  // can't break out how much is JVM *heap*. This helper adds that missing view:
+  // Runtime heap usage alongside the same /proc/self/status RSS the native side
+  // logs. Correlating the two answers the key question when an executor is
+  // OOMKilled — is the growth in the JVM heap / shuffle sorter, or in native
+  // C++ allocations? Toggle with FD_DEBUG_MEM (default on).
+  // -------------------------------------------------------------------------
+  object MemDebug {
+    val enabled: Boolean =
+      sys.env.getOrElse("FD_DEBUG_MEM", "true").toLowerCase match {
+        case "0" | "false" | "no" => false
+        case _                    => true
+      }
+    // Emit a heap snapshot every N batches on the hot processing loops.
+    val everyNBatches: Int =
+      scala.util.Try(sys.env.getOrElse("FD_DEBUG_MEM_BATCHES", "200").toInt).getOrElse(200)
+
+    // A kB field (VmRSS/VmHWM) from /proc/self/status — whole-process resident
+    // memory (JVM + all native allocations), i.e. what the k8s OOMKiller acts
+    // on. Returns -1 on non-Linux (local macOS dev), so callers stay quiet.
+    private def statusKb(key: String): Long =
+      try {
+        val src = scala.io.Source.fromFile("/proc/self/status")
+        try src.getLines().find(_.startsWith(key))
+              .map(_.replaceAll("[^0-9]", "").toLong).getOrElse(-1L)
+        finally src.close()
+      } catch { case _: Throwable => -1L }
+
+    def snapshot(tag: String): String = {
+      val rt         = Runtime.getRuntime
+      val heapUsed   = (rt.totalMemory - rt.freeMemory) / (1024 * 1024)
+      val heapCommit = rt.totalMemory / (1024 * 1024)
+      val heapMax    = rt.maxMemory   / (1024 * 1024)
+      val rssMb      = statusKb("VmRSS:") / 1024
+      val peakRssMb  = statusKb("VmHWM:") / 1024
+      s"[FD_MEM] $tag heapUsed=${heapUsed}MB heapCommitted=${heapCommit}MB " +
+      s"heapMax=${heapMax}MB rss=${rssMb}MB peakRss=${peakRssMb}MB"
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Partitioner: routes all lines with the same serialKey to one reducer
   // -------------------------------------------------------------------------
   class SerialKeyPartitioner(val numPartitions: Int) extends Partitioner {
@@ -503,17 +546,73 @@ object StackDistancePipelineJob {
           // network directory this file belongs to (e.g. "z" from .../f/z/O/...).
           val handle = FDComputeNative.mapperInit(s3Path, mapperEnvOverrides)
 
-          val collected = readEncryptedGzipFile(s3Path, fileConf)
-            .grouped(mapperBatchSize)
-            .flatMap { batch =>
-              val out = FDComputeNative.mapperProcessBatch(handle, batch.mkString("\n"))
-              if (out == null || out.isEmpty) Iterator.empty
-              else out.linesIterator.filter(_.nonEmpty)
-            }
-            .toList  // materialise before mapperFinalize so all lines are processed
+          // mapperFinalize logs per-file stats and, crucially, frees the native
+          // MapperCtx behind `handle`. It MUST run exactly once per file no
+          // matter how this task ends, or that native context leaks. It emits no
+          // output lines, so it only has to run after the file's final
+          // mapperProcessBatch. finalizeOnce() guards the call with an
+          // AtomicBoolean so the two independent triggers below can never
+          // double-free the same context.
+          val finalized = new java.util.concurrent.atomic.AtomicBoolean(false)
+          def finalizeOnce(): Unit =
+            if (finalized.compareAndSet(false, true)) FDComputeNative.mapperFinalize(handle)
 
-          FDComputeNative.mapperFinalize(handle)
-          collected.iterator
+          // Trigger #2 (backstop): if the task is killed (e.g. "another attempt
+          // succeeded" in the logs) or an exception is thrown mid-file, the
+          // streaming iterator below never reaches its last batch, so Trigger #1
+          // never fires. Free the native context on task completion instead.
+          // Without this, every killed giant-file task would leak a MapperCtx
+          // into the executor JVM that is reused across ~15 sequential files —
+          // compounding native memory pressure and hastening the very OOM this
+          // job is fighting.
+          Option(TaskContext.get()).foreach(
+            _.addTaskCompletionListener[Unit](_ => finalizeOnce()))
+
+          // Stream the C++ mapper's output into the shuffle one batch at a time.
+          // The previous `.toList` buffered the ENTIRE per-file mapper output in
+          // the JVM heap (up to ~19 GiB for the 2+ GB expansion files, per the
+          // ShuffleExternalSorter spill logs) before returning — an instant
+          // executor OOM. This iterator keeps only one batch (~mapperBatchSize
+          // lines) resident and lets Spark's shuffle writer spill incrementally.
+          //
+          // Trigger #1 (normal path): advance() calls finalizeOnce() the instant
+          // the input file is exhausted — i.e. immediately after the last
+          // mapperProcessBatch — the direct, easy-to-verify mapperFinalize call
+          // site. (Hand-rolled rather than Spark's CompletionIterator, which is
+          // private[spark] and not accessible from this package.)
+          val batches = readEncryptedGzipFile(s3Path, fileConf).grouped(mapperBatchSize)
+
+          new Iterator[String] {
+            private var cur: Iterator[String] = Iterator.empty
+            private var batchNum = 0
+
+            @scala.annotation.tailrec
+            private def advance(): Boolean =
+              if (cur.hasNext) true
+              else if (batches.hasNext) {
+                val out = FDComputeNative.mapperProcessBatch(handle, batches.next().mkString("\n"))
+                batchNum += 1
+                // JVM-heap snapshot every N batches. Native RSS/progress comes
+                // from the C++ [FD_MEM] mapper/process lines; this adds the heap
+                // view so we can tell shuffle-sorter heap growth apart from
+                // native growth. Goes to executor stderr (keep the pod with
+                // spark.kubernetes.executor.deleteOnTermination=false to read it).
+                if (MemDebug.enabled && batchNum % MemDebug.everyNBatches == 0)
+                  System.err.println(MemDebug.snapshot(
+                    s"mapper/scala batch=$batchNum file=${s3Path.split('/').last}"))
+                cur = if (out == null || out.isEmpty) Iterator.empty
+                      else out.linesIterator.filter(_.nonEmpty)
+                advance()
+              } else {
+                finalizeOnce()  // input fully consumed → free MapperCtx exactly once
+                false
+              }
+
+            def hasNext: Boolean = advance()
+            def next(): String =
+              if (advance()) cur.next()
+              else throw new NoSuchElementException("mapper output iterator exhausted")
+          }
         }
       }
 
@@ -696,6 +795,7 @@ object StackDistancePipelineJob {
         log(s"envOverrides: ${envOverridesStr.replace("\n", " | ")}")
         native.reducerInit(partitionId, numReducers, envOverridesStr)
         log("reducerInit OK")
+        if (MemDebug.enabled) log(MemDebug.snapshot(s"reducer/scala post-init"))
 
         var batchCount = 0
         var lineCount  = 0
@@ -703,11 +803,18 @@ object StackDistancePipelineJob {
           batchCount += 1
           lineCount  += batch.size
           native.reducerProcessBatch(batch.mkString("\n"))
+          // Periodic heap snapshot during reduce. Unlike the mapper's (which
+          // only reaches executor stderr), these use log() and are collected
+          // back to the driver, so reduce-stage memory is always visible.
+          if (MemDebug.enabled && batchCount % MemDebug.everyNBatches == 0)
+            log(MemDebug.snapshot(s"reducer/scala batch=$batchCount lines=$lineCount"))
         }
         log(s"reducerProcessBatch done: $batchCount batches, $lineCount lines total")
+        if (MemDebug.enabled) log(MemDebug.snapshot(s"reducer/scala pre-finalize lines=$lineCount"))
 
         native.reducerFinalize()
         log("reducerFinalize OK")
+        if (MemDebug.enabled) log(MemDebug.snapshot(s"reducer/scala post-finalize"))
 
         // ── Inspect output directory ─────────────────────────────────────
         log(s"FD_MAPREDUCE_OUTPUT_DIR=$localOutputDir  FD_MAPREDUCE_HDFS_ODIR=${sys.env.getOrElse("FD_MAPREDUCE_HDFS_ODIR","<not set>")}")

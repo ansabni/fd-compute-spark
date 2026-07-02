@@ -10,6 +10,7 @@
 #include <string>
 #include "stack_distance.config.h"
 #include "stack_distance.map.h"
+#include "mem_debug.h"
 
 using namespace std ;
 
@@ -294,6 +295,8 @@ MapperCtx *mapperInit(const char *inputFilename) {
   ctx->invalidLinesCount = 0 ;
   ctx->ignoredLinesCount = 0 ;
   ctx->skipAllLines      = false ;
+  ctx->outBytesTotal     = 0 ;
+  ctx->nextMemLogAt      = fd_mem_debug_interval() ;
 
   if (inputFilename && inputFilename[0] != '\0') {
     int r = resolveGhostIp(inputFilename) ;
@@ -306,6 +309,14 @@ MapperCtx *mapperInit(const char *inputFilename) {
   } else {
     ctx->match_ip = -1 ;
   }
+
+  // Baseline memory snapshot at partition start — lets us see the resident set
+  // this mapper task began with (JVM + native already loaded) before it starts
+  // consuming the input file, so growth attributable to this file is visible.
+  if (fd_mem_debug_enabled())
+    fprintf(stderr, "[FD_MEM] mapper/init file='%s' rss=%lldkB peak=%lldkB oom_score=%d\n",
+            (inputFilename && inputFilename[0]) ? inputFilename : "(none)",
+            fd_read_rss_kb(), fd_read_peak_kb(), fd_read_oom_score()) ;
   return ctx ;
 }
 
@@ -318,6 +329,10 @@ void processLogLinesBatch(MapperCtx *ctx, const char *inputBuf, string &outbuf) 
 
   int match_ip  = ctx->match_ip ;
   int numghosts = (int)ghosts.size() ;
+
+  // Read the debug toggles once per batch (they are cheaply cached internally).
+  const bool      fdMem         = fd_mem_debug_enabled() ;
+  const long long fdMemInterval = fd_mem_debug_interval() ;
 
   char line[LOG_LINE_LENGTH];
   char map[LOG_LINE_LENGTH];
@@ -358,6 +373,21 @@ void processLogLinesBatch(MapperCtx *ctx, const char *inputBuf, string &outbuf) 
     ctx->allLinesCount++ ;
     objstatus[0] = '\0' ;
     max_age = -1 ;
+
+    // Periodic progress + process-memory line. Threshold-based (not modulo) so
+    // it fires reliably regardless of how many lines were skipped/continued.
+    // For a 193M-line expansion file at the default 5M interval this is ~38
+    // lines total — cheap, but enough to pinpoint how far a task got and
+    // whether native RSS is climbing before an OOMKill.
+    if (fdMem && ctx->allLinesCount >= ctx->nextMemLogAt) {
+      fprintf(stderr,
+              "[FD_MEM] mapper/process lines=%lld invalid=%lld ignored=%lld "
+              "outBytesSoFar=%lld rss=%lldkB peak=%lldkB oom_score=%d\n",
+              ctx->allLinesCount, ctx->invalidLinesCount, ctx->ignoredLinesCount,
+              ctx->outBytesTotal, fd_read_rss_kb(), fd_read_peak_kb(), fd_read_oom_score()) ;
+      fflush(stderr) ;
+      ctx->nextMemLogAt += fdMemInterval ;
+    }
 
     // Lines that start with a # are comments
     if (line[0] == '#') { ctx->invalidLinesCount++ ; continue ; }
@@ -514,6 +544,11 @@ void processLogLinesBatch(MapperCtx *ctx, const char *inputBuf, string &outbuf) 
       ctx->ignoredLinesCount++ ;
     }
   }
+
+  // Track cumulative mapper output volume across batches. Reveals output
+  // amplification (e.g. computeBothServedAndMiss emits two lines per input
+  // line) that drives the downstream shuffle-sort memory the JVM must hold.
+  ctx->outBytesTotal += (long long) outbuf.size() ;
 }
 
 //---------------------------------------------------------------------------
@@ -522,6 +557,12 @@ void processLogLinesBatch(MapperCtx *ctx, const char *inputBuf, string &outbuf) 
 void mapperFinalize(MapperCtx *ctx) {
   fprintf(stderr, "Lines read %lld, invalid lines %lld, ignored lines %lld\n",
           ctx->allLinesCount, ctx->invalidLinesCount, ctx->ignoredLinesCount) ;
+  if (fd_mem_debug_enabled())
+    fprintf(stderr,
+            "[FD_MEM] mapper/finalize lines=%lld outBytesTotal=%lld "
+            "rss=%lldkB peak=%lldkB oom_score=%d\n",
+            ctx->allLinesCount, ctx->outBytesTotal,
+            fd_read_rss_kb(), fd_read_peak_kb(), fd_read_oom_score()) ;
   delete ctx ;
   // Reset config globals so the next mapperInit()/readConfig() starts clean.
   // Safe when executor.cores=1 (mapper tasks are sequential on a given JVM).

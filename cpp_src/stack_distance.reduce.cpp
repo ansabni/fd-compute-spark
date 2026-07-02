@@ -12,6 +12,7 @@
 #include "splay.h"
 #include "stack_distance.config.h"
 #include "stack_distance.reduce.h"
+#include "mem_debug.h"
 
 //---------------------------------------------------------------------------
 // Variables — all thread_local so each Spark executor thread (task) gets
@@ -287,6 +288,18 @@ void allocate_memory() {
     allocated += ( (timelen/TIMEBUCKET)*sizeof(traffic_t) ) ;
   }
   fprintf ( stdout, "Allocated memory = %lld Bytes\n", allocated ) ;
+
+  // Make the size of this up-front allocation explicit in the logs. With the
+  // default NODELEN (105,000,000) the arrays below sum to ~5 GB, grabbed the
+  // instant the first line reaches a reducer partition — a prime OOM suspect on
+  // an 8 GB executor. rss here is the whole process (JVM + native) right after
+  // the malloc/calloc calls commit.
+  if (fd_mem_debug_enabled())
+    fprintf ( stdout,
+              "[FD_MEM] reducer/allocate nodelen=%d timelen=%d allocatedMB=%lld "
+              "rss=%lldkB peak=%lldkB oom_score=%d\n",
+              nodelen, timelen, allocated/(1024*1024),
+              fd_read_rss_kb(), fd_read_peak_kb(), fd_read_oom_score() ) ;
 
 }
 
@@ -711,6 +724,13 @@ void reducerInit() {
   if (spatialSampleAttempt > 0 && spatialSampleAttempt == attemptId) {
     g_doSpatialSampling = true ;
   }
+
+  // Baseline memory at partition start, before allocate_memory() runs on the
+  // first input line. Comparing this against the reducer/allocate line shows
+  // exactly how much the big up-front arrays add.
+  if (fd_mem_debug_enabled())
+    fprintf(stdout, "[FD_MEM] reducer/init partition=%d rss=%lldkB peak=%lldkB oom_score=%d\n",
+            partition_2, fd_read_rss_kb(), fd_read_peak_kb(), fd_read_oom_score()) ;
 }
 
 //---------------------------------------------------------------------------
@@ -815,11 +835,12 @@ void processReducerBatch(const char *inputBuf) {
       //increment count to report the MAX count
       g_count++ ;
       if ((g_count % 1000000) == 0) {
-        int oom_score = -1 ;
-        fprintf(stdout, "skipped %lld :: md5_count %d ===", g_count, md5_count) ;
-        read_oom_score(&oom_score) ;
-        fprintf(stdout, "oom_score %d", oom_score) ;
-        fprintf(stdout, "\n") ;
+        fprintf(stdout,
+                "[FD_MEM] reducer/md5-exceeded skipped=%lld md5_count=%d "
+                "rss=%lldkB peak=%lldkB oom_score=%d\n",
+                g_count, md5_count,
+                fd_read_rss_kb(), fd_read_peak_kb(), fd_read_oom_score()) ;
+        fflush(stdout) ;
       }
       continue ;
     }
@@ -849,14 +870,17 @@ void processReducerBatch(const char *inputBuf) {
 
     // Check after each million (i.e. 2^20) lines
     if ((g_count % 1048576) == 0) {
-      statm_t mem_stat ;
-      int oom_score = -1 ;
-      fprintf(stdout, "processed %lld :: md5_count %d ===", g_count, md5_count) ;
-      //read_off_memory_status(&mem_stat) ;
-      fprintf(stdout, " size %ldkB rss %ldkB text %ldkB data %ldkB ",
-              mem_stat.size*4096/1000, mem_stat.resident*4096/1000,
-              mem_stat.text*4096/1000, mem_stat.data*4096/1000) ;
-      fprintf(stdout, "\n") ;
+      // NOTE: this block previously printed an *uninitialised* statm_t (the
+      // read_off_memory_status() call was commented out), emitting garbage
+      // size/rss/text/data numbers. Replaced with real /proc/self accounting.
+      if (fd_mem_debug_enabled()) {
+        fprintf(stdout,
+                "[FD_MEM] reducer/process processed=%lld readcount=%lld md5_count=%d "
+                "max_id=%d total_bytes=%lld rss=%lldkB peak=%lldkB oom_score=%d\n",
+                g_count, g_readcount, md5_count, max_id, g_total_bytes,
+                fd_read_rss_kb(), fd_read_peak_kb(), fd_read_oom_score()) ;
+        fflush(stdout) ;
+      }
     }
 
     bool skippingStackOnEntryBarrier = false ;
@@ -955,6 +979,11 @@ void reducerFinalize() {
           g_readcount, g_sampleSkippedCount, g_prewarmSkippedCount) ;
   fprintf(stdout, "%lld requests, %lld bytes bypassed cache due to entry barrier.\n",
           entryBarrierMissRequests, entryBarrierMissBytes) ;
+  if (fd_mem_debug_enabled())
+    fprintf(stdout, "[FD_MEM] reducer/finalize readcount=%lld count=%lld md5_count=%d max_id=%d "
+                    "rss=%lldkB peak=%lldkB oom_score=%d\n",
+            g_readcount, g_count, md5_count, max_id,
+            fd_read_rss_kb(), fd_read_peak_kb(), fd_read_oom_score()) ;
   printTimeDetails() ;
 
   if (g_total_bytes == 0) g_non_empty = 0 ;
